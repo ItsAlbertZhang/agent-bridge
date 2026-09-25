@@ -40,7 +40,7 @@ fn help_is_available_at_every_command_layer() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("agent-bridge"));
         if flag == "--version" {
-            assert!(stdout.contains("0.2.0"));
+            assert!(stdout.contains("0.3.0"));
         }
     }
 }

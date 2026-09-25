@@ -106,13 +106,48 @@ fn an_unready_server_is_spawned_and_the_wait_is_bounded() {
             "bridge",
             "--port",
             "12899",
+            "--no-open",
         ],
-        "the explicit entry point has exactly these arguments, without --no-open"
+        "the explicit entry point has exactly these arguments; status sends nothing, so no browser"
     );
     assert!(
         state.join("dsh/daemon.pid").exists(),
         "the spawned pid is recorded"
     );
+}
+
+#[test]
+fn only_verbs_that_send_input_let_a_launched_dsh_open_the_browser() {
+    let cwd = env!("CARGO_MANIFEST_DIR");
+    let verbs: [(&[&str], bool); 7] = [
+        (&["run", "--cwd", cwd, "--prompt", "hi", "--no-wait"], true),
+        (&["steer", "--thread", "T1", "--text", "go"], true),
+        (&["wait", "--thread", "T1"], false),
+        (&["reply", "--thread", "T1", "--decision", "accept"], false),
+        (&["interrupt", "--thread", "T1"], false),
+        (&["status", "--thread", "T1"], false),
+        (&["read", "--thread", "T1"], false),
+    ];
+    // Probing a dead port is slow on Windows, so the verbs run side by side.
+    std::thread::scope(|scope| {
+        for (args, opens) in verbs {
+            scope.spawn(move || {
+                let state = TempDir::new("spawn-view");
+                let output = cli(dead_port(), &state)
+                    .env("AGENT_BRIDGE_DSH_READY_TIMEOUT_MS", "300")
+                    .args(args)
+                    .output()
+                    .expect("running agent-bridge");
+                assert_eq!(code(&output), 4, "the fake never becomes ready: {args:?}");
+                let spawned = node_args(&state).expect("the fake node must have been invoked");
+                assert_eq!(
+                    !spawned.iter().any(|arg| arg == "--no-open"),
+                    opens,
+                    "{args:?} spawned {spawned:?}"
+                );
+            });
+        }
+    });
 }
 
 #[test]

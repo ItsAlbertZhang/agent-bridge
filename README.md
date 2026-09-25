@@ -102,7 +102,7 @@ Backend options, accepted before or after the verb:
 | `--url <ws url>` | endpoint; overrides `AGENT_BRIDGE_<BACKEND>_URL` and the default |
 | `--log <file>` | append events to this file instead of the default thread log; conflicts with `--no-log` |
 | `--no-log` | no thread log; conflicts with `--log` |
-| `--no-pane` | Codex only: do not open or reuse a Herdr pane |
+| `--no-pane` | Codex only: `run` and `steer` do not open or reuse a Herdr pane; other verbs accept it and never open one anyway |
 
 Every verb except `daemon` first makes sure the backend daemon is running
 (see [Daemons](#daemons)).
@@ -146,7 +146,8 @@ agent-bridge codex wait --thread <threadId> --stall-secs 300 --timeout-secs 1800
 ```
 
 Resumes the thread and waits for the next outcome. An already idle thread
-reports its last turn immediately (exit 0 or 1 by its status).
+reports its last turn immediately (exit 0 or 1 by its status). `wait` opens
+neither a pane nor a browser; see [Human view](#human-view).
 
 ### reply
 
@@ -338,7 +339,9 @@ to `daemon.log`. It does not inherit the caller's standard handles, so piping
 the CLI's stdout does not keep the pipe open after the CLI exits. On Windows
 the child gets a hidden console (`CREATE_NO_WINDOW`); on Unix it is put in its
 own session. Its pid is written to `daemon.pid`. Codex receives no `-c`
-overrides; dsh receives neither `--no-open` nor any permission-mode variable.
+overrides. dsh receives no permission-mode variable, and receives `--no-open`
+unless the launching command is `run`, `steer`, or `daemon start`/`restart`
+(see [Human view](#human-view)).
 The dsh UI port and the plugin's WebSocket port are different things: `--url`
 selects the plugin endpoint and does not configure the plugin's listener.
 
@@ -364,10 +367,17 @@ line.
 
 ## Human view
 
+Only the verbs that send the agent new input bring up a human view: `run`
+(including `run --thread`) and `steer`. `wait`, `reply`, `interrupt`,
+`status`, and `read` attach to, answer, or read a thread and never open one,
+so a caller can keep a `wait` running without a window appearing. `reply`
+answers a request raised during a turn that `run` started; the view that
+`run` brought up is where a human watches it.
+
 ### Codex: Herdr pane
 
-`run`, `wait`, `reply`, and `steer` open a terminal pane with a Codex TUI
-attached to the thread when all of these hold: `HERDR_ENV=1` is set,
+`run` and `steer` open a terminal pane with a Codex TUI attached to the
+thread when all of these hold: `HERDR_ENV=1` is set,
 `--no-pane` is absent, and a `herdr` executable is found (on `PATH`, or
 `AGENT_BRIDGE_CODEX_HERDR_BIN`). The pane is named `codex-` plus the first 8
 characters of the thread id and is reused across commands for the same thread:
@@ -402,8 +412,12 @@ link. `started.uiUrl` prefers the last complete `dsh web:` URL in `daemon.log`
 default UI URL.
 
 Opening a token URL logs the browser in with a cookie valid for 30 days that
-survives daemon restarts; the token itself changes with every process. dsh
-opens a browser on its own every time the daemon is launched.
+survives daemon restarts; the token itself changes with every process.
+
+dsh opens a browser on its own when its daemon launches, and only then. The
+CLI allows it when `run`, `steer`, or `daemon start`/`restart` launches the
+daemon; any other verb that has to launch it passes `--no-open`. A daemon
+that is already running opens nothing, whatever the verb.
 
 The browser shows progress and lets a human steer or cancel. Approvals and
 questions raised during a turn the bridge started are delivered to the bridge
@@ -471,8 +485,10 @@ dispatch rules in one place.
 - `reply` without `--request-id` on an idle thread spends the full 10-second
   window and then exits 4; use `wait` to read an idle thread's outcome.
 - `read` on dsh reports only the newest turn's `finalMessage`.
-- dsh `daemon status` can report a token from a previous daemon process, and
-  dsh opens a browser window on every daemon launch.
+- dsh `daemon status` can report a token from a previous daemon process.
+- dsh opens a browser window only when it launches. A daemon first launched
+  by `wait` or `status` never opens one, and a later `run` finds it running;
+  use `uiUrl` from `started` or `daemon status`.
 - The Codex pane is never closed by the CLI.
 - A dsh thread resumed after a daemon restart uses the server's current model
   selection, not necessarily the one it was created with.

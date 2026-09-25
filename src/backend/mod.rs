@@ -101,7 +101,9 @@ pub trait Backend {
 
     fn state_name(&self) -> &'static str;
     fn env_prefix(&self) -> &'static str;
-    fn daemon_command(&self, url: &str) -> Result<std::process::Command>;
+    /// `view` is false when the command that launches the daemon must not
+    /// bring up a human view of its own.
+    fn daemon_command(&self, url: &str, view: bool) -> Result<std::process::Command>;
     async fn after_ready(&self, log_offset: u64, report: bool) -> Value;
     fn daemon_fields(&self) -> Value;
 

@@ -47,10 +47,14 @@ enum Step {
     Exit(i32),
 }
 
+/// Only the verbs that send the agent new input (`run`, `steer`) bring up a
+/// human view: the Codex pane, or the browser dsh opens when it launches.
+/// Verbs that attach, read, answer or interrupt pass `view: false`.
 async fn open(
     backend: &impl Backend,
     global: &Global,
     thread_id: Option<&str>,
+    view: bool,
 ) -> Result<(Opened, Emitter)> {
     let out = if global.no_log {
         Emitter::new(None)?
@@ -61,7 +65,7 @@ async fn open(
     } else {
         Emitter::new(None)?
     };
-    daemon::ensure(backend, &global.url).await?;
+    daemon::ensure(backend, &global.url, view).await?;
     Ok((backend.connect(&global.url).await?, out))
 }
 
@@ -74,7 +78,7 @@ pub async fn run<B: Backend>(
     settings: &ModelSettings,
 ) -> Result<i32> {
     let common = args.common();
-    let (opened, mut out) = open(backend, global, common.thread.as_deref()).await?;
+    let (opened, mut out) = open(backend, global, common.thread.as_deref(), true).await?;
     let started = match &common.thread {
         Some(id) => backend.start_existing_thread(&opened.conn, id).await?,
         None => {
@@ -128,11 +132,8 @@ pub async fn wait<B: Backend>(
     thread_id: &str,
     opts: &WaitFlags,
 ) -> Result<i32> {
-    let (opened, out) = open(backend, global, Some(thread_id)).await?;
+    let (opened, out) = open(backend, global, Some(thread_id), false).await?;
     let mut session = Session::new(backend, opened, thread_id.to_string(), out);
-    backend
-        .attach(&session.conn, &global.url, thread_id, None)
-        .await;
     if let Some(code) = session.resume().await? {
         return Ok(code);
     }
@@ -147,11 +148,8 @@ pub async fn reply<B: Backend>(
     payload: ReplyPayload<B::Decision>,
     opts: &WaitFlags,
 ) -> Result<i32> {
-    let (opened, out) = open(backend, global, Some(thread_id)).await?;
+    let (opened, out) = open(backend, global, Some(thread_id), false).await?;
     let mut session = Session::new(backend, opened, thread_id.to_string(), out);
-    backend
-        .attach(&session.conn, &global.url, thread_id, None)
-        .await;
     let Some(id) = request_id else {
         return session.reply_to_only_request(payload, opts).await;
     };
@@ -173,7 +171,7 @@ pub async fn steer<B: Backend>(
     turn: Option<&str>,
     text: &str,
 ) -> Result<i32> {
-    let (opened, mut out) = open(backend, global, Some(thread_id)).await?;
+    let (opened, mut out) = open(backend, global, Some(thread_id), true).await?;
     backend
         .attach(&opened.conn, &global.url, thread_id, None)
         .await;
@@ -193,7 +191,7 @@ pub async fn steer<B: Backend>(
 }
 
 pub async fn interrupt(backend: &impl Backend, global: &Global, thread_id: &str) -> Result<i32> {
-    let (opened, mut out) = open(backend, global, Some(thread_id)).await?;
+    let (opened, mut out) = open(backend, global, Some(thread_id), false).await?;
     let thread = backend.read_thread(&opened.conn, thread_id, true).await?;
     let turn_id = active_turn(&thread, thread_id, "interrupt")?;
     let result = backend.interrupt(&opened.conn, thread_id, &turn_id).await?;
@@ -204,14 +202,14 @@ pub async fn interrupt(backend: &impl Backend, global: &Global, thread_id: &str)
 }
 
 pub async fn status(backend: &impl Backend, global: &Global, thread_id: &str) -> Result<i32> {
-    let (opened, mut out) = open(backend, global, Some(thread_id)).await?;
+    let (opened, mut out) = open(backend, global, Some(thread_id), false).await?;
     let thread = backend.read_thread(&opened.conn, thread_id, false).await?;
     out.emit(&json!({"threadId":thread_id, "status":thread.status, "cwd":thread.cwd, "model":thread.model}));
     Ok(EXIT_COMPLETED)
 }
 
 pub async fn read(backend: &impl Backend, global: &Global, thread_id: &str) -> Result<i32> {
-    let (opened, mut out) = open(backend, global, Some(thread_id)).await?;
+    let (opened, mut out) = open(backend, global, Some(thread_id), false).await?;
     let thread = backend.read_thread(&opened.conn, thread_id, true).await?;
     let turns: Vec<Value> = thread
         .turns

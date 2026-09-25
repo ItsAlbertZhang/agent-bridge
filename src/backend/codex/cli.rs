@@ -16,7 +16,7 @@ pub struct Cli {
     pub url: String,
     #[command(flatten)]
     pub log: crate::cli::LogFlags,
-    /// Do not open or reuse a Herdr pane for the thread.
+    /// Do not open or reuse a Herdr pane for the thread (only run and steer open one).
     #[arg(long, global = true)]
     pub no_pane: bool,
     #[command(subcommand)]

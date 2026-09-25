@@ -31,7 +31,7 @@ impl Backend for Dsh {
         "AGENT_BRIDGE_DSH_"
     }
 
-    fn daemon_command(&self, _url: &str) -> Result<std::process::Command> {
+    fn daemon_command(&self, _url: &str, view: bool) -> Result<std::process::Command> {
         let mut command = match std::env::var_os("AGENT_BRIDGE_DSH_BIN")
             .filter(|bin| !bin.is_empty())
         {
@@ -56,6 +56,10 @@ impl Backend for Dsh {
             .arg(ui::setting("AGENT_BRIDGE_DSH_PROFILE", "bridge"))
             .arg("--port")
             .arg(ui::ui_port());
+        // dsh opens the browser on every launch unless told not to.
+        if !view {
+            command.arg("--no-open");
+        }
         Ok(command)
     }
 

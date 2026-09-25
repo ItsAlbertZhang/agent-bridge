@@ -33,7 +33,7 @@ impl Backend for Codex {
         "AGENT_BRIDGE_CODEX_"
     }
 
-    fn daemon_command(&self, url: &str) -> Result<std::process::Command> {
+    fn daemon_command(&self, url: &str, _view: bool) -> Result<std::process::Command> {
         let bin = std::env::var("AGENT_BRIDGE_CODEX_BIN")
             .ok()
             .filter(|bin| !bin.is_empty())

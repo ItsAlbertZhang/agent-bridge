@@ -4,13 +4,17 @@
 mod common;
 
 use std::path::PathBuf;
-use std::process::Output;
+use std::process::{Command, Output};
 
 use serde_json::json;
 
-use common::{base_handler, cli, code, fake_herdr, idle, lines, ok, start_mock, Recorder, TempDir};
+use common::{
+    base_handler, cli, code, fake_herdr, idle, lines, ok, start_mock, thread_value, Recorder,
+    TempDir,
+};
 
-/// A mock that starts thread `T1` and answers one turn, plus the fake herdr.
+/// A mock that starts thread `T1`, answers one turn, resumes and steers it,
+/// plus the fake herdr.
 struct Fixture {
     port: u16,
     state: TempDir,
@@ -20,11 +24,21 @@ struct Fixture {
 impl Fixture {
     fn new(tag: &str) -> Self {
         let recorder = Recorder::default();
-        let port = start_mock(base_handler(recorder, "T1", idle(), |msg, tx, method| {
-            if method == "turn/start" {
-                ok(tx, msg, json!({ "turn": { "id": "U1" } }));
-            }
-        }));
+        let port = start_mock(base_handler(
+            recorder,
+            "T1",
+            idle(),
+            |msg, tx, method| match method {
+                "turn/start" => ok(tx, msg, json!({ "turn": { "id": "U1" } })),
+                "thread/resume" => ok(
+                    tx,
+                    msg,
+                    json!({ "thread": thread_value("T1", idle(), json!([])) }),
+                ),
+                "turn/steer" => ok(tx, msg, json!({})),
+                _ => {}
+            },
+        ));
         let state = TempDir::new(tag);
         let herdr = fake_herdr(&state);
         Self { port, state, herdr }
@@ -32,6 +46,14 @@ impl Fixture {
 
     /// `run --no-wait` inside a Herdr session, with `agent get` answering `get`.
     fn run(&self, agent_get: &str, extra: &[(&str, &str)]) -> Output {
+        self.command(agent_get, extra)
+            .args(["run", "--cwd", "/tmp", "--prompt", "hi", "--no-wait"])
+            .output()
+            .expect("running agent-bridge")
+    }
+
+    /// Any verb inside a Herdr session, with `agent get` answering `get`.
+    fn command(&self, agent_get: &str, extra: &[(&str, &str)]) -> Command {
         let mut command = cli(self.port, &self.state);
         command
             .env("HERDR_ENV", "1")
@@ -48,9 +70,6 @@ impl Fixture {
             command.env(key, value);
         }
         command
-            .args(["run", "--cwd", "/tmp", "--prompt", "hi", "--no-wait"])
-            .output()
-            .expect("running agent-bridge")
     }
 
     fn herdr_log(&self) -> Option<String> {
@@ -318,4 +337,56 @@ fn outside_herdr_there_is_no_pane() {
 
     assert_started(&output);
     assert_eq!(fixture.herdr_log(), None, "herdr must not be called at all");
+}
+
+#[test]
+fn steer_opens_a_pane_like_run() {
+    let fixture = Fixture::new("pane-steer");
+    let output = fixture
+        .command("1", &[])
+        .args(["steer", "--thread", "T1", "--turn", "U1", "--text", "go"])
+        .output()
+        .expect("running agent-bridge");
+    assert_eq!(code(&output), 0, "{output:?}");
+    assert_eq!(lines(&output)[0]["event"], "steered");
+
+    let log = fixture.herdr_log().expect("herdr must have been called");
+    assert!(
+        log.contains("pane split --current --direction right --ratio 0.45 --cwd /tmp"),
+        "steer sends the agent input, so a human can watch: {log}"
+    );
+    assert!(log.contains("agent start codex-T1"), "got: {log}");
+}
+
+#[test]
+fn wait_and_reply_never_open_a_pane() {
+    let fixture = Fixture::new("pane-attach-only");
+    let verbs: [&[&str]; 3] = [
+        &["wait", "--thread", "T1"],
+        // Kept as a harmless flag for callers that still pass it.
+        &["wait", "--thread", "T1", "--no-pane"],
+        &[
+            "reply",
+            "--thread",
+            "T1",
+            "--request-id",
+            "5",
+            "--decision",
+            "accept",
+        ],
+    ];
+    for args in verbs {
+        let output = fixture
+            .command("1", &[])
+            .args(args)
+            .output()
+            .expect("running agent-bridge");
+        assert_eq!(code(&output), 0, "{args:?}: {output:?}");
+        assert_eq!(lines(&output)[0]["event"], "turn", "{args:?}");
+        assert_eq!(
+            fixture.herdr_log(),
+            None,
+            "{args:?} must not call herdr at all"
+        );
+    }
 }

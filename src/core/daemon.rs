@@ -117,18 +117,19 @@ pub async fn probe_ready(ws_url: &str) -> bool {
 }
 
 /// Ready, or started and then ready. Called by every subcommand but `daemon`.
-pub async fn ensure(backend: &impl Backend, ws_url: &str) -> Result<()> {
-    bring_up(backend, ws_url, false).await.map(|_| ())
+/// `view` is whether a daemon launched here may open its own human view.
+pub async fn ensure(backend: &impl Backend, ws_url: &str, view: bool) -> Result<()> {
+    bring_up(backend, ws_url, false, view).await.map(|_| ())
 }
 
-async fn bring_up(backend: &impl Backend, ws_url: &str, report: bool) -> Result<Value> {
+async fn bring_up(backend: &impl Backend, ws_url: &str, report: bool, view: bool) -> Result<Value> {
     if probe_ready(ws_url).await {
         return Ok(json!({}));
     }
     let offset = std::fs::metadata(state_dir(backend).join(LOG_FILE))
         .map(|meta| meta.len())
         .unwrap_or(0);
-    spawn(backend, ws_url)?;
+    spawn(backend, ws_url, view)?;
     let timeout = ready_timeout_ms(backend);
     let deadline = Instant::now() + Duration::from_millis(timeout);
     loop {
@@ -193,7 +194,7 @@ fn no_inherit_std_handles() {
 }
 
 /// Spawn the backend command so that it outlives this process.
-fn spawn(backend: &impl Backend, ws_url: &str) -> Result<u32> {
+fn spawn(backend: &impl Backend, ws_url: &str, view: bool) -> Result<u32> {
     let dir = state_dir(backend);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating state dir {}", dir.display()))?;
@@ -206,7 +207,7 @@ fn spawn(backend: &impl Backend, ws_url: &str) -> Result<u32> {
         .try_clone()
         .context("duplicating the daemon log handle")?;
 
-    let mut command = backend.daemon_command(ws_url)?;
+    let mut command = backend.daemon_command(ws_url, view)?;
     command
         .current_dir(daemon_cwd(backend))
         .stdin(Stdio::null())
@@ -325,7 +326,7 @@ pub async fn run(backend: &impl Backend, ws_url: &str, action: Action) -> Result
             Ok(0)
         }
         Action::Start => {
-            let fresh = bring_up(backend, ws_url, true).await?;
+            let fresh = bring_up(backend, ws_url, true, true).await?;
             emit(&status_value(backend, ws_url, fresh).await);
             Ok(0)
         }
@@ -336,7 +337,7 @@ pub async fn run(backend: &impl Backend, ws_url: &str, action: Action) -> Result
                 return Ok(code);
             }
             wait_until_down(backend, ws_url).await;
-            let fresh = bring_up(backend, ws_url, true).await?;
+            let fresh = bring_up(backend, ws_url, true, true).await?;
             emit(&status_value(backend, ws_url, fresh).await);
             Ok(0)
         }
