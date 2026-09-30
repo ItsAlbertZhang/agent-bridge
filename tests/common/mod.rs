@@ -257,11 +257,15 @@ pub fn fake_codex(dir: &TempDir) -> PathBuf {
 /// Write an executable stand-in for `herdr`. It records every invocation in
 /// `$FAKE_HERDR_LOG`, answers `agent get` with `$FAKE_HERDR_AGENT_GET`, prints
 /// `$FAKE_HERDR_PANE_LIST` (a JSON blob; unset means `pane list` prints
-/// nothing) for `pane list`, succeeds at `pane rename`, fails
-/// `pane split` when `$FAKE_HERDR_SPLIT_FAIL` is `1`, fails `agent start` when
-/// `$FAKE_HERDR_START_FAIL` is `1`, and fails the first
+/// nothing) for `pane list` and `$FAKE_HERDR_PROCESS_INFO` the same way for
+/// `pane process-info`, succeeds at `pane rename`, fails `pane split` when
+/// `$FAKE_HERDR_SPLIT_FAIL` is `1`, and fails the first
 /// `$FAKE_HERDR_RENAME_FAILS` `agent rename` calls, counting them in the file
-/// `$FAKE_HERDR_RENAME_COUNT`.
+/// `$FAKE_HERDR_RENAME_COUNT`. Past those, `agent rename` works the way
+/// herdr's does, only on a pane with an agent in it: one an `agent start` was
+/// recorded for, or `$FAKE_HERDR_AGENT_PANE`. `agent start` is refused with a
+/// line on stderr when `$FAKE_HERDR_START_FAIL` is `1`, and ends in herdr's
+/// own timeout error when it is `timeout`.
 pub fn fake_herdr(dir: &TempDir) -> PathBuf {
     write_script(
         dir,
@@ -277,6 +281,7 @@ pub fn fake_herdr(dir: &TempDir) -> PathBuf {
          if \"%1 %2\"==\"agent rename\" goto rename\r\n\
          if \"%1 %2\"==\"pane rename\" exit /b 0\r\n\
          if \"%1 %2\"==\"pane list\" goto list\r\n\
+         if \"%1 %2\"==\"pane process-info\" goto info\r\n\
          if not \"%1 %2\"==\"pane split\" exit /b 0\r\n\
          if \"%FAKE_HERDR_SPLIT_FAIL%\"==\"1\" exit /b 3\r\n\
          echo {\"result\":{\"pane\":{\"pane_id\":\"P9\"}}}\r\n\
@@ -285,36 +290,65 @@ pub fn fake_herdr(dir: &TempDir) -> PathBuf {
          if \"%FAKE_HERDR_PANE_LIST%\"==\"\" exit /b 0\r\n\
          echo %FAKE_HERDR_PANE_LIST%\r\n\
          exit /b 0\r\n\
-         :start\r\n\
-         if \"%FAKE_HERDR_START_FAIL%\"==\"1\" exit /b 7\r\n\
+         :info\r\n\
+         if \"%FAKE_HERDR_PROCESS_INFO%\"==\"\" exit /b 0\r\n\
+         echo %FAKE_HERDR_PROCESS_INFO%\r\n\
          exit /b 0\r\n\
+         :start\r\n\
+         if \"%FAKE_HERDR_START_FAIL%\"==\"timeout\" goto timeout\r\n\
+         if \"%FAKE_HERDR_START_FAIL%\"==\"1\" goto refused\r\n\
+         exit /b 0\r\n\
+         :timeout\r\n\
+         >&2 echo {\"error\":{\"code\":\"timeout\",\"message\":\"timed out waiting for agent startup\"},\"id\":\"cli:agent:start\"}\r\n\
+         exit /b 1\r\n\
+         :refused\r\n\
+         >&2 echo start refused\r\n\
+         exit /b 7\r\n\
          :rename\r\n\
-         if \"%FAKE_HERDR_RENAME_FAILS%\"==\"\" exit /b 0\r\n\
+         if \"%FAKE_HERDR_RENAME_FAILS%\"==\"\" goto detected\r\n\
          set /a COUNT=0\r\n\
          if exist \"%FAKE_HERDR_RENAME_COUNT%\" set /p COUNT=<\"%FAKE_HERDR_RENAME_COUNT%\"\r\n\
          set /a COUNT+=1\r\n\
          >\"%FAKE_HERDR_RENAME_COUNT%\" echo %COUNT%\r\n\
          if %COUNT% LEQ %FAKE_HERDR_RENAME_FAILS% exit /b 5\r\n\
+         :detected\r\n\
+         if \"%FAKE_HERDR_AGENT_PANE%\"==\"%3\" exit /b 0\r\n\
+         findstr /C:\"--kind codex --pane %3 \" \"%FAKE_HERDR_LOG%\" >nul 2>nul\r\n\
+         if errorlevel 1 exit /b 5\r\n\
          exit /b 0\r\n",
         "#!/bin/sh\n\
          echo \"$@\" >>\"$FAKE_HERDR_LOG\"\n\
          [ \"$1 $2\" = \"agent get\" ] && exit \"$FAKE_HERDR_AGENT_GET\"\n\
          if [ \"$1 $2\" = \"agent start\" ]; then\n\
-           [ \"$FAKE_HERDR_START_FAIL\" = \"1\" ] && exit 7\n\
+           if [ \"$FAKE_HERDR_START_FAIL\" = \"timeout\" ]; then\n\
+             echo '{\"error\":{\"code\":\"timeout\",\"message\":\"timed out waiting for agent startup\"},\"id\":\"cli:agent:start\"}' >&2\n\
+             exit 1\n\
+           fi\n\
+           if [ \"$FAKE_HERDR_START_FAIL\" = \"1\" ]; then\n\
+             echo 'start refused' >&2\n\
+             exit 7\n\
+           fi\n\
            exit 0\n\
          fi\n\
          if [ \"$1 $2\" = \"agent rename\" ]; then\n\
-           [ -z \"$FAKE_HERDR_RENAME_FAILS\" ] && exit 0\n\
-           count=0\n\
-           [ -f \"$FAKE_HERDR_RENAME_COUNT\" ] && count=$(cat \"$FAKE_HERDR_RENAME_COUNT\")\n\
-           count=$((count + 1))\n\
-           echo \"$count\" >\"$FAKE_HERDR_RENAME_COUNT\"\n\
-           [ \"$count\" -le \"$FAKE_HERDR_RENAME_FAILS\" ] && exit 5\n\
+           if [ -n \"$FAKE_HERDR_RENAME_FAILS\" ]; then\n\
+             count=0\n\
+             [ -f \"$FAKE_HERDR_RENAME_COUNT\" ] && count=$(cat \"$FAKE_HERDR_RENAME_COUNT\")\n\
+             count=$((count + 1))\n\
+             echo \"$count\" >\"$FAKE_HERDR_RENAME_COUNT\"\n\
+             [ \"$count\" -le \"$FAKE_HERDR_RENAME_FAILS\" ] && exit 5\n\
+           fi\n\
+           [ \"$FAKE_HERDR_AGENT_PANE\" = \"$3\" ] && exit 0\n\
+           grep -q -e \"--kind codex --pane $3 \" \"$FAKE_HERDR_LOG\" || exit 5\n\
            exit 0\n\
          fi\n\
          [ \"$1 $2\" = \"pane rename\" ] && exit 0\n\
          if [ \"$1 $2\" = \"pane list\" ]; then\n\
            [ -n \"$FAKE_HERDR_PANE_LIST\" ] && echo \"$FAKE_HERDR_PANE_LIST\"\n\
+           exit 0\n\
+         fi\n\
+         if [ \"$1 $2\" = \"pane process-info\" ]; then\n\
+           [ -n \"$FAKE_HERDR_PROCESS_INFO\" ] && echo \"$FAKE_HERDR_PROCESS_INFO\"\n\
            exit 0\n\
          fi\n\
          [ \"$1 $2\" = \"pane split\" ] || exit 0\n\

@@ -379,15 +379,34 @@ answers a request raised during a turn that `run` started; the view that
 `run` and `steer` open a terminal pane with a Codex TUI attached to the
 thread when all of these hold: `HERDR_ENV=1` is set,
 `--no-pane` is absent, and a `herdr` executable is found (on `PATH`, or
-`AGENT_BRIDGE_CODEX_HERDR_BIN`). The pane is named `codex-` plus the first 8
-characters of the thread id and is reused across commands for the same thread:
-an existing agent with that name means nothing is done; a pane still carrying
-that label (its TUI closed) gets Codex started again; otherwise a new pane is
-split to the right (ratio 0.45) in the thread's cwd, labelled, and after a
-short settling delay Herdr runs `codex resume <threadId> --remote <url>` in it.
-Pane problems are one line on stderr each and never affect stdout or the exit
-code. The CLI never closes a pane. Ctrl+C in the TUI detaches that view; the
-server's turn keeps running.
+`AGENT_BRIDGE_CODEX_HERDR_BIN`). The pane comes after the turn was started or
+the steer was sent; a waiting `run` brings it up while it waits.
+
+The pane and the agent in it are both named `codex-` plus hex digits 5 to 12
+of the thread id, the low end of the thread's creation time in milliseconds:
+thread `01a0f13c-3ae2-...` gets `codex-f13c3ae2`. What happens depends on what
+Herdr already has under that name:
+
+- An agent answers to it: the thread is being watched and nothing is done.
+- A pane is labelled with it and its foreground process was started on this
+  thread id (the TUI is there, only its agent name is missing): the name is
+  bound to it.
+- A pane is labelled with it and runs anything else (the TUI was closed, or
+  something else was started there since): the label is cleared and the pane
+  is otherwise left alone. Nothing is ever typed into a pane the CLI did not
+  just split.
+- Otherwise, and after the previous case, a new pane is split to the right
+  (ratio 0.45) in the thread's cwd and labelled, Herdr runs `codex resume
+  <threadId> --remote <url>` in it with `herdr agent start`, and the agent
+  name is bound once that call has returned.
+
+The agent taking its name is what counts as success. `herdr agent start`
+itself always runs into its 5 second timeout on this TUI, which is therefore
+not reported; Herdr renames no agent before its start has returned, so a new
+pane takes about that long. Binding the name is tried 10 times, one second
+apart; if it never works, that is one line on stderr. Pane problems never
+affect stdout or the exit code. The CLI never closes a pane. Ctrl+C in the TUI
+detaches that view; the server's turn keeps running.
 
 To open a remote TUI by hand for a new thread, pass the working directory,
 because new remote threads otherwise inherit the daemon's cwd (the home
@@ -446,8 +465,7 @@ Empty values count as unset.
 | `AGENT_BRIDGE_CODEX_BIN` | `codex`; executable used to spawn the app-server |
 | `AGENT_BRIDGE_CODEX_HERDR_BIN` | `herdr` on `PATH`; Herdr executable for panes |
 | `AGENT_BRIDGE_CODEX_READY_TIMEOUT_MS` | `15000`; readiness deadline, and twice the restart shutdown deadline |
-| `AGENT_BRIDGE_CODEX_PANE_DELAY_MS` | `2000`; settling delay after splitting a pane |
-| `AGENT_BRIDGE_CODEX_PANE_RETRY_MS` | `500`; delay between agent-rename retries |
+| `AGENT_BRIDGE_CODEX_PANE_RETRY_MS` | `1000`; delay between agent-rename attempts |
 | `HERDR_ENV` | `1` enables pane integration |
 
 | dsh | Default and purpose |

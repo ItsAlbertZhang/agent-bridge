@@ -1,8 +1,9 @@
 //! The Herdr pane: a human-visible Codex TUI attached to the thread.
 //!
 //! Best effort by construction. Every failure is one line on stderr and nothing
-//! else: the pane never touches stdout or the exit code. Nothing here closes a
-//! pane either — the human presses Ctrl+C in the TUI and closes it.
+//! else: the pane never touches stdout or the exit code. Nothing here types
+//! into a pane it did not split itself, and nothing closes a pane either — the
+//! human presses Ctrl+C in the TUI and closes it.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -12,19 +13,16 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
-/// How long the freshly split pane's shell gets before the agent is attached.
-const SHELL_SETTLE_MS: u64 = 2_000;
-
-/// How long herdr may spend on `agent start`. Short on purpose: herdr counts a
-/// start as successful only once the agent accepts input, and a thread resumed
-/// mid-turn never does before the turn ends. Detecting codex in the pane is all
-/// this needs, so the wait is cut short and its outcome is not load bearing.
+/// How long herdr may spend on `agent start`, which is how long a pane takes to
+/// come up: herdr cannot tell when this TUI is ready, so every start runs into
+/// this timeout (see [`start`]). herdr takes nothing under three seconds.
 const START_TIMEOUT_MS: &str = "5000";
 
-/// Pause between `agent rename` attempts, and how many retries follow the first
-/// call: detection may still be in flight when `agent start` returns.
-const RENAME_RETRY_MS: u64 = 500;
-const RENAME_RETRIES: u32 = 10;
+/// Pause between `agent rename` attempts, and how many there are. herdr renames
+/// only an agent it has detected in the pane, and none whose start is still
+/// pending, which another call's may be.
+const RENAME_RETRY_MS: u64 = 1_000;
+const RENAME_ATTEMPTS: u32 = 10;
 
 /// The herdr executable, when a pane is wanted at all.
 ///
@@ -55,24 +53,21 @@ fn which(name: &str) -> Option<PathBuf> {
     })
 }
 
-/// Herdr agent names are `codex-` plus the thread id's first 8 characters.
+/// Herdr names, for the pane and the agent alike, are `codex-` plus the last 8
+/// of the 12 hex digits a thread id opens with. Those 12 are the thread's
+/// creation time in milliseconds, and their first 8 stay the same for about a
+/// minute, which would hand threads started together the same name.
 pub fn agent_name(thread_id: &str) -> String {
-    format!("codex-{}", thread_id.chars().take(8).collect::<String>())
-}
-
-fn settle_ms() -> u64 {
-    env_ms("AGENT_BRIDGE_CODEX_PANE_DELAY_MS", SHELL_SETTLE_MS)
+    let stamp: Vec<char> = thread_id.chars().filter(|c| *c != '-').take(12).collect();
+    let low = &stamp[stamp.len().saturating_sub(8)..];
+    format!("codex-{}", low.iter().collect::<String>())
 }
 
 fn rename_retry_ms() -> u64 {
-    env_ms("AGENT_BRIDGE_CODEX_PANE_RETRY_MS", RENAME_RETRY_MS)
-}
-
-fn env_ms(key: &str, default: u64) -> u64 {
-    std::env::var(key)
+    std::env::var("AGENT_BRIDGE_CODEX_PANE_RETRY_MS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+        .unwrap_or(RENAME_RETRY_MS)
 }
 
 /// One line on stderr, which is all any pane trouble ever earns.
@@ -93,25 +88,60 @@ where
         .with_context(|| format!("running {}", bin.display()))
 }
 
-/// Open a pane for `thread_id`, or reuse the one that is already there.
+/// Open a pane for `thread_id`, unless the thread is being watched already.
 ///
-/// Three ways it can go: the agent is still attached and nothing is needed; the
-/// TUI is gone but its pane survives under the same name, so codex is started
-/// again in it; or there is no pane at all and one is split.
+/// Three ways it can go: an agent answers to the thread's name and nothing is
+/// needed; a pane carries the name and runs the thread's TUI, which only lacks
+/// its agent name, so that is bound; or a pane is split and codex started in it.
 pub async fn open(bin: &Path, thread_id: &str, cwd: &str, ws_url: &str) -> Result<()> {
     let name = agent_name(thread_id);
     if herdr(bin, ["agent", "get", &name]).await?.status.success() {
         return Ok(()); // Someone is already watching this thread.
     }
 
-    // The agent name dies with the TUI, the pane label does not. A pane still
-    // carrying the name is the pane this thread was watched in, so codex goes
-    // back into it instead of onto a second pane beside the empty one.
+    // The agent name dies with the TUI, the pane label does not, so a pane can
+    // carry the name with anything at all running in it.
     if let Some(pane_id) = pane_by_label(bin, &name).await {
-        attach(bin, &pane_id, &name, thread_id, ws_url).await;
-        return Ok(());
+        if shows_thread(bin, &pane_id, thread_id).await {
+            return rename(bin, &pane_id, &name).await;
+        }
+        // Not this thread's TUI: a shell the TUI left behind, or whatever the
+        // human started there since. Nothing is typed into such a pane, and it
+        // gives up the name the new pane is about to take.
+        //
+        // Known gap: a pane split for this thread a moment ago looks just like
+        // that for about a second, until codex is its foreground process. A
+        // second call for the thread that lands in that second splits a pane
+        // of its own, and the thread ends up with two TUIs.
+        if let Err(err) = clear_label(bin, &pane_id).await {
+            warn(&format!("{err:#}"));
+        }
     }
 
+    let pane_id = split(bin, cwd).await?;
+    // Label the pane straight away: this is what the next call finds while the
+    // agent in it has no name yet.
+    if let Err(err) = label_pane(bin, &pane_id, &name).await {
+        warn(&format!("{err:#}"));
+    }
+
+    // What the start said only matters when no agent turns up to take the name.
+    let started = start(bin, &pane_id, &name, thread_id, ws_url).await;
+    let Err(err) = rename(bin, &pane_id, &name).await else {
+        return Ok(());
+    };
+    match started {
+        Ok(started) if !started.status.success() => bail!(
+            "{err:#}; herdr agent start: {}",
+            String::from_utf8_lossy(&started.stderr).trim()
+        ),
+        Ok(_) => Err(err),
+        Err(start_err) => bail!("{err:#}; herdr agent start: {start_err:#}"),
+    }
+}
+
+/// Split a pane beside the caller's.
+async fn split(bin: &Path, cwd: &str) -> Result<String> {
     let split = herdr(
         bin,
         [
@@ -133,7 +163,7 @@ pub async fn open(bin: &Path, thread_id: &str, cwd: &str, ws_url: &str) -> Resul
             String::from_utf8_lossy(&split.stderr).trim()
         );
     }
-    let pane_id = serde_json::from_slice::<Value>(&split.stdout)
+    serde_json::from_slice::<Value>(&split.stdout)
         .ok()
         .and_then(|value| {
             value
@@ -141,23 +171,25 @@ pub async fn open(bin: &Path, thread_id: &str, cwd: &str, ws_url: &str) -> Resul
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })
-        .ok_or_else(|| anyhow!("herdr pane split printed no .result.pane.pane_id"))?;
-
-    // Label the pane straight away: this is what the next call finds once the
-    // TUI is gone and `agent get` has nothing left to answer with.
-    if let Err(err) = label_pane(bin, &pane_id, &name).await {
-        warn(&format!("{err:#}"));
-    }
-
-    tokio::time::sleep(Duration::from_millis(settle_ms())).await;
-    attach(bin, &pane_id, &name, thread_id, ws_url).await;
-    Ok(())
+        .ok_or_else(|| anyhow!("herdr pane split printed no .result.pane.pane_id"))
 }
 
-/// Start codex in `pane_id` and bind `name` to it. Best effort throughout: a
-/// pane that is busy refuses both halves and all that earns is stderr.
-async fn attach(bin: &Path, pane_id: &str, name: &str, thread_id: &str, ws_url: &str) {
-    match herdr(
+/// Have herdr start codex in `pane_id`, and wait the start out.
+///
+/// `agent start` answers once the agent takes input or the timeout runs out,
+/// and herdr cannot tell when this TUI does: every start ends in that timeout,
+/// with codex up in the pane all the same. So the answer says nothing by
+/// itself, and [`rename`] working is the proof that the TUI came up. The wait
+/// cannot be skipped, though: until the start has returned, herdr refuses to
+/// rename the agent, and a start whose client leaves early stays pending.
+async fn start(
+    bin: &Path,
+    pane_id: &str,
+    name: &str,
+    thread_id: &str,
+    ws_url: &str,
+) -> Result<Output> {
+    herdr(
         bin,
         [
             "agent",
@@ -177,22 +209,6 @@ async fn attach(bin: &Path, pane_id: &str, name: &str, thread_id: &str, ws_url: 
         ],
     )
     .await
-    {
-        Ok(started) if started.status.success() => {}
-        Ok(started) => warn(&format!(
-            "herdr agent start did not confirm readiness: {}",
-            String::from_utf8_lossy(&started.stderr).trim()
-        )),
-        Err(err) => warn(&format!("herdr agent start failed: {err:#}")),
-    }
-
-    // The name is bound here, not by `agent start`: a start that timed out still
-    // left codex running in the pane, and without the name the next call finds
-    // no agent and splits a second pane. On the happy path the agent already
-    // carries the name and this renames it to itself.
-    if let Err(err) = rename(bin, pane_id, name).await {
-        warn(&format!("{err:#}"));
-    }
 }
 
 /// The id of the pane labelled `name`, if `herdr pane list` reports one.
@@ -214,6 +230,32 @@ async fn pane_by_label(bin: &Path, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether the pane's foreground process was started on `thread_id`. The TUI
+/// is `codex resume <thread id> --remote <url>`, so the id is on its command
+/// line, which is there as soon as the process is and does not depend on herdr
+/// recognising an agent.
+///
+/// Silent like [`pane_by_label`]: whatever keeps the answer away reads as "no".
+async fn shows_thread(bin: &Path, pane_id: &str, thread_id: &str) -> bool {
+    let Ok(info) = herdr(bin, ["pane", "process-info", "--pane", pane_id]).await else {
+        return false;
+    };
+    if !info.status.success() {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(&info.stdout) else {
+        return false;
+    };
+    value
+        .pointer("/result/process_info/foreground_processes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|process| process.get("argv").and_then(Value::as_array))
+        .flatten()
+        .any(|arg| arg.as_str() == Some(thread_id))
+}
+
 /// Label the pane itself, which outlives the agent attached to it.
 async fn label_pane(bin: &Path, pane_id: &str, name: &str) -> Result<()> {
     let output = herdr(bin, ["pane", "rename", pane_id, name]).await?;
@@ -226,10 +268,21 @@ async fn label_pane(bin: &Path, pane_id: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Bind `name` to the pane, retrying while herdr is still making up its mind.
+async fn clear_label(bin: &Path, pane_id: &str) -> Result<()> {
+    let output = herdr(bin, ["pane", "rename", pane_id, "--clear"]).await?;
+    if !output.status.success() {
+        bail!(
+            "herdr pane rename {pane_id} --clear failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Bind `name` to the agent in the pane, retrying until herdr has detected one.
 async fn rename(bin: &Path, pane_id: &str, name: &str) -> Result<()> {
     let mut last = String::new();
-    for attempt in 0..=RENAME_RETRIES {
+    for attempt in 0..RENAME_ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(rename_retry_ms())).await;
         }
@@ -239,10 +292,7 @@ async fn rename(bin: &Path, pane_id: &str, name: &str) -> Result<()> {
             Err(err) => last = format!("{err:#}"),
         }
     }
-    bail!(
-        "herdr agent rename {pane_id} {name} failed {} times: {last}",
-        RENAME_RETRIES + 1
-    )
+    bail!("herdr agent rename {pane_id} {name} failed {RENAME_ATTEMPTS} times: {last}")
 }
 
 #[cfg(test)]
@@ -250,8 +300,16 @@ mod tests {
     use super::agent_name;
 
     #[test]
-    fn the_agent_name_is_the_thread_id_prefix() {
-        assert_eq!(agent_name("0199abcd-ef01-7000-8000-0123"), "codex-0199abcd");
+    fn the_agent_name_is_the_low_end_of_the_thread_ids_timestamp() {
+        assert_eq!(
+            agent_name("0199abcd-ef01-7000-8000-0123456789ab"),
+            "codex-abcdef01"
+        );
+        // Started within the same minute: same first 8 digits, different names.
+        assert_ne!(
+            agent_name("0199abcd-ef01-7000-8000-0123456789ab"),
+            agent_name("0199abcd-f234-7000-8000-0123456789ab")
+        );
         assert_eq!(agent_name("short"), "codex-short");
     }
 }

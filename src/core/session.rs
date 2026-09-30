@@ -112,18 +112,22 @@ pub async fn run<B: Backend>(
         json!({"event":"started", "threadId":session.thread_id, "turnId":session.turn_id});
     extend_fields(&mut event, fields);
     session.out.emit(&event);
-    backend
-        .attach(
-            &session.conn,
-            &global.url,
-            &session.thread_id,
-            common.cwd.as_deref().or_else(|| thread.cwd.as_str()),
-        )
-        .await;
+    let conn = session.conn.clone();
+    let thread_id = session.thread_id.clone();
+    let view = backend.attach(
+        &conn,
+        &global.url,
+        &thread_id,
+        common.cwd.as_deref().or_else(|| thread.cwd.as_str()),
+    );
     if common.no_wait {
+        view.await;
         return Ok(EXIT_COMPLETED);
     }
-    session.wait_loop(&common.wait, None).await
+    // The view comes up beside the wait, not ahead of it: that takes seconds,
+    // and the turn's events are not held back for them.
+    let (code, ()) = tokio::join!(session.wait_loop(&common.wait, None), view);
+    code
 }
 
 pub async fn wait<B: Backend>(
@@ -172,9 +176,6 @@ pub async fn steer<B: Backend>(
     text: &str,
 ) -> Result<i32> {
     let (opened, mut out) = open(backend, global, Some(thread_id), true).await?;
-    backend
-        .attach(&opened.conn, &global.url, thread_id, None)
-        .await;
     let turn_id = match turn {
         Some(id) => id.to_string(),
         None => active_turn(
@@ -187,6 +188,11 @@ pub async fn steer<B: Backend>(
         .steer(&opened.conn, thread_id, &turn_id, text)
         .await?;
     out.emit(&json!({"event":"steered", "threadId":thread_id, "result":result}));
+    // The view comes after the message, as in `run`: a steer that was refused
+    // brings nothing up, and one that went through is not held back by it.
+    backend
+        .attach(&opened.conn, &global.url, thread_id, None)
+        .await;
     Ok(EXIT_COMPLETED)
 }
 

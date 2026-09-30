@@ -1,6 +1,6 @@
 [package]
 name = "agent-bridge"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Transport-only CLI for local Codex and dsh backends"
 license = "MIT"
